@@ -42,20 +42,15 @@ final class CompiledFunction: @unchecked (Sendable) {
     ///
     /// ### Why this takes `evalLock`
     ///
-    /// `mlx_detail_compile_erase` is `compiler_cache().erase(fun_id)`, i.e.
-    /// `std::unordered_map::erase` on the *same* process-global
-    /// `mlx::core::detail::CompilerCache` that ``innerCall(_:)`` reads and
-    /// inserts into via `CompilerCache::find` (`cache_[fun_id]`, which itself
-    /// can insert and rehash, followed by `entries.push_back`).  That cache has
-    /// no synchronization of its own, and `find` hands back a *reference* to an
-    /// entry that the caller then fills in and reads from across the whole
-    /// trace.  An unlocked erase can therefore rehash the map out from under a
-    /// concurrent `find`, or destroy the very entry another thread is compiling
-    /// into.
+    /// The compile cache is per thread, and `mlx_detail_compile_erase` erases
+    /// ``id`` from every thread's cache, not only the one passed in (our MLX
+    /// core fork).  A trace left on any thread would otherwise be replayed by
+    /// a later function that is allocated at this address, with this
+    /// function's constants.
     ///
-    /// Every other use of that cache happens under `evalLock`, so the erase has
-    /// to as well; otherwise the lock does not actually make the cache
-    /// single-threaded, it only makes most of it single-threaded.
+    /// The core cache locks its own map, but every other use of the compiler
+    /// happens under `evalLock`, so the erase does too and never runs
+    /// concurrently with a trace.
     ///
     /// ### Why blocking here is safe
     ///
