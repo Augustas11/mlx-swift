@@ -18,7 +18,11 @@ class FP8Tests: XCTestCase {
         XCTAssertEqual(decoded.shape, [256])
 
         let expected = MLXArray(allBytes.map { e4m3Value($0) })
-        assertEqual(decoded, expected)
+        XCTAssertTrue(
+            decoded.allClose(expected, equalNaN: true).item(Bool.self),
+            "contents differ:\n\(decoded)\n\(expected)")
+        // E4M3FN has no infinities; S.1111.111 is its only NaN.
+        XCTAssertEqual(isNaN(decoded).sum().item(Int.self), 2)
     }
 
     func testToFP8EncodesE4M3Bytes() {
@@ -42,6 +46,9 @@ private func e4m3Value(_ value: UInt8) -> Float {
     let exponent = Int((value >> 3) & 0x0F)
     let mantissa = Int(value & 0x07)
 
+    if exponent == 0x0F && mantissa == 0x07 {
+        return .nan
+    }
     if exponent == 0 {
         if mantissa == 0 {
             return sign < 0 ? -0.0 : 0.0
