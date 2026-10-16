@@ -41,6 +41,7 @@ let noMetalCmlxExcludes = [
     "mlx/mlx/backend/metal/compiled.cpp",
     "mlx/mlx/backend/metal/conv.cpp",
     "mlx/mlx/backend/metal/copy.cpp",
+    "mlx/mlx/backend/metal/cross_entropy.cpp",
     "mlx/mlx/backend/metal/custom_kernel.cpp",
     "mlx/mlx/backend/metal/device.cpp",
     "mlx/mlx/backend/metal/device_info.cpp",
@@ -49,6 +50,7 @@ let noMetalCmlxExcludes = [
     "mlx/mlx/backend/metal/event.cpp",
     "mlx/mlx/backend/metal/fence.cpp",
     "mlx/mlx/backend/metal/fft.cpp",
+    "mlx/mlx/backend/metal/gated_delta_update.cpp",
     "mlx/mlx/backend/metal/hadamard.cpp",
     "mlx/mlx/backend/metal/indexing.cpp",
     "mlx/mlx/backend/metal/jit_kernels.cpp",
@@ -77,10 +79,12 @@ let noCudaCmlxExcludes = [
     // Exclude CUDA backend files, but keep no_cuda.cpp for stubs
     // mlx/mlx/backend/cuda/no_cuda.cpp
     "mlx/mlx/backend/cuda/allocator.cpp",
+    "mlx/mlx/backend/cuda/cholesky.cu",
     "mlx/mlx/backend/cuda/compiled.cpp",
     "mlx/mlx/backend/cuda/conv.cpp",
     "mlx/mlx/backend/cuda/cublas_utils.cpp",
     "mlx/mlx/backend/cuda/cudnn_utils.cpp",
+    "mlx/mlx/backend/cuda/cusolver_utils.cpp",
     "mlx/mlx/backend/cuda/custom_kernel.cpp",
     "mlx/mlx/backend/cuda/delayload.cpp",
     "mlx/mlx/backend/cuda/device_info.cpp",
@@ -97,6 +101,7 @@ let noCudaCmlxExcludes = [
     "mlx/mlx/backend/cuda/scaled_dot_product_attention.cpp",
     "mlx/mlx/backend/cuda/slicing.cpp",
     "mlx/mlx/backend/cuda/utils.cpp",
+    "mlx/mlx/backend/cuda/wddm.cpp",
     "mlx/mlx/backend/cuda/worker.cpp",
     "mlx/mlx/backend/cuda/binary",
     "mlx/mlx/backend/cuda/conv",
@@ -134,6 +139,7 @@ let noCudaCmlxExcludes = [
                 "mlx-c/mlx/c/metal.cpp",
 
                 "mlx/mlx/backend/cuda/delayload.cpp",  // For Windows
+                "mlx/mlx/backend/cuda/wddm.cpp",  // For Windows
 
                 // built by the CudaBuild plugin (nvcc), not by SwiftPM
                 "mlx/mlx/backend/cuda/quantized/qmm",
@@ -266,8 +272,9 @@ let cmlx = Target.target(
 
         // mlx files that are not part of the build
         "mlx/ACKNOWLEDGMENTS.md",
+        "mlx/AGENTS.md",
+        "mlx/CITATION.cff",
         "mlx/CMakeLists.txt",
-        "mlx/CODE_OF_CONDUCT.md",
         "mlx/CONTRIBUTING.md",
         "mlx/LICENSE",
         "mlx/MANIFEST.in",
