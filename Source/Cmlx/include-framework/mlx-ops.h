@@ -1672,6 +1672,27 @@ MLX_API array gather_qmm(
     bool sorted_indices = false,
     StreamOrDevice s = {});
 
+/**
+ * macprovider: the gather_qmm signature before MLX 0.32.3 added global_scale,
+ * for callers built against it (mlx-c, which mlx-swift vendors from upstream,
+ * still passes sorted_indices right after mode). Same as passing
+ * global_scale = std::nullopt. sorted_indices has no default so that a call
+ * ending at mode still resolves to the overload above.
+ */
+MLX_API array gather_qmm(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    std::optional<array> lhs_indices,
+    std::optional<array> rhs_indices,
+    bool transpose,
+    std::optional<int> group_size,
+    std::optional<int> bits,
+    const std::string& mode,
+    bool sorted_indices,
+    StreamOrDevice s = {});
+
 MLX_API array gather_qqmm(
     const array& x,
     const array& w,
