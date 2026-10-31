@@ -2522,12 +2522,14 @@ public func quantizedMatmul(
     transpose: Bool = true,
     groupSize: Int? = nil, bits: Int? = nil,
     mode: QuantizationMode = .affine,
+    referencePrefill: Bool = false,
     stream: StreamOrDevice = .default
 ) -> MLXArray {
     quantizedMM(
         x, w, scales: scales, biases: biases,
         transpose: transpose,
         groupSize: groupSize, bits: bits, mode: mode,
+        referencePrefill: referencePrefill,
         stream: stream)
 }
 
@@ -2556,6 +2558,7 @@ public func quantizedMM(
     transpose: Bool = true,
     groupSize: Int? = nil, bits: Int? = nil,
     mode: QuantizationMode = .affine,
+    referencePrefill: Bool = false,
     stream: StreamOrDevice = .default
 ) -> MLXArray {
     var result = mlx_array_new()
@@ -2563,11 +2566,12 @@ public func quantizedMM(
     let gs = mlx_optional_int(value: Int32(groupSize ?? 0), has_value: groupSize != nil)
     let bits = mlx_optional_int(value: Int32(bits ?? 0), has_value: bits != nil)
 
-    mlx_quantized_matmul(
+    mlx_quantized_matmul_reference_prefill(
         &result,
         x.ctx, w.ctx, scales.ctx, (biases ?? .mlxNone).ctx,
         transpose, gs, bits,
         mode.rawValue,
+        referencePrefill,
         stream.ctx
     )
     return MLXArray(result)
