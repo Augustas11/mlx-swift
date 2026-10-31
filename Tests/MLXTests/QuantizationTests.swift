@@ -89,6 +89,22 @@ class QuantizationTests: XCTestCase {
             quantized3.describeExtra(0), "(inputDimensions=512, outputDimensions=1024, bias=true)")
     }
 
+    func testQuantizedLinearPreservesReferencePrefillOptIn() {
+        Device.withDefaultDevice(.cpu) {
+            let flagged = Linear(
+                64, 32, bias: false, referencePrefill: true
+            ).toQuantized(groupSize: 64, bits: 4) as! QuantizedLinear
+            let ordinary = Linear(64, 32, bias: false)
+                .toQuantized(groupSize: 64, bits: 4) as! QuantizedLinear
+
+            XCTAssertTrue(flagged.referencePrefill)
+            XCTAssertFalse(ordinary.referencePrefill)
+
+            let input = MLXArray.ones([1, 3, 64])
+            eval(flagged(input), ordinary(input))
+        }
+    }
+
     func testQuantizedEmbeddingShapeDesc() {
         let embedding1 = Embedding(embeddingCount: 512, dimensions: 1024)
         let quantized1 = embedding1.toQuantized(groupSize: 64, bits: 4)

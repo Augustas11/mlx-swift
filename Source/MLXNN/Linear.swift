@@ -71,6 +71,9 @@ open class Linear: Module, UnaryLayer, Quantizable {
 
     public let weight: MLXArray
     public let bias: MLXArray?
+    /// Use the vendor split-K accumulation for multi-token quantized prefill.
+    /// Decode and unflagged layers retain the batch-invariant kernel route.
+    public let referencePrefill: Bool
 
     open var shape: (Int, Int) {
         weight.shape2
@@ -84,7 +87,10 @@ open class Linear: Module, UnaryLayer, Quantizable {
     ///   - inputDimensions: number of input dimensions
     ///   - outputDimensions: number of output dimensions
     ///   - bias: if `true` this layer will apply a bias
-    public init(_ inputDimensions: Int, _ outputDimensions: Int, bias: Bool = true) {
+    public init(
+        _ inputDimensions: Int, _ outputDimensions: Int, bias: Bool = true,
+        referencePrefill: Bool = false
+    ) {
         let scale = sqrt(1.0 / Float(inputDimensions))
         self.weight = MLXRandom.uniform(-scale ..< scale, [outputDimensions, inputDimensions])
         if bias {
@@ -92,6 +98,7 @@ open class Linear: Module, UnaryLayer, Quantizable {
         } else {
             self.bias = nil
         }
+        self.referencePrefill = referencePrefill
         super.init()
     }
 
@@ -101,17 +108,26 @@ open class Linear: Module, UnaryLayer, Quantizable {
     ///   - inputDimensions: number of input dimensions
     ///   - outputDimensions: number of output dimensions
     ///   - bias: if `true` this layer will apply a bias
-    public convenience init(inputDimensions: Int, outputDimensions: Int, bias: Bool = true) {
-        self.init(inputDimensions, outputDimensions, bias: bias)
+    public convenience init(
+        inputDimensions: Int, outputDimensions: Int, bias: Bool = true,
+        referencePrefill: Bool = false
+    ) {
+        self.init(
+            inputDimensions, outputDimensions, bias: bias,
+            referencePrefill: referencePrefill)
     }
 
     /// Initializer meant for subclasses to provide weight and bias arrays directly.
     ///
     /// This is used e.g. by ``QuantizedLinear`` to provide quantized weights and biases
     /// rather than have ``Linear`` compute them.
-    public init(weight: MLXArray, bias: MLXArray? = nil) {
+    public init(
+        weight: MLXArray, bias: MLXArray? = nil,
+        referencePrefill: Bool = false
+    ) {
         self.weight = weight
         self.bias = bias
+        self.referencePrefill = referencePrefill
     }
 
     /// Describe the `inputDimensions` and `outputDimensions`.

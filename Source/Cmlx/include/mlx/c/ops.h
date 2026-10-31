@@ -931,6 +931,18 @@ int mlx_quantized_matmul(
     mlx_optional_int bits,
     const char* mode,
     const mlx_stream s);
+int mlx_quantized_matmul_reference_prefill(
+    mlx_array* res,
+    const mlx_array x,
+    const mlx_array w,
+    const mlx_array scales,
+    const mlx_array biases /* may be null */,
+    bool transpose,
+    mlx_optional_int group_size,
+    mlx_optional_int bits,
+    const char* mode,
+    bool reference_prefill,
+    const mlx_stream s);
 int mlx_radians(mlx_array* res, const mlx_array a, const mlx_stream s);
 int mlx_real(mlx_array* res, const mlx_array a, const mlx_stream s);
 int mlx_reciprocal(mlx_array* res, const mlx_array a, const mlx_stream s);

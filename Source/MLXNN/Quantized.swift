@@ -292,7 +292,8 @@ open class QuantizedLinear: Linear, Quantized {
     public convenience init(
         _ inputDimensions: Int, _ outputDimensions: Int,
         bias: Bool = true, groupSize: Int = 64, bits: Int = 4,
-        mode: QuantizationMode = .affine
+        mode: QuantizationMode = .affine,
+        referencePrefill: Bool = false
     ) {
         let scale = sqrt(1 / Float(inputDimensions))
         let weight = MLXRandom.uniform(
@@ -300,7 +301,9 @@ open class QuantizedLinear: Linear, Quantized {
 
         let bias = bias ? MLXArray.zeros([outputDimensions]) : nil
 
-        self.init(weight: weight, bias: bias, groupSize: groupSize, bits: bits, mode: mode)
+        self.init(
+            weight: weight, bias: bias, groupSize: groupSize, bits: bits,
+            mode: mode, referencePrefill: referencePrefill)
     }
 
     /// Initialize a QuantizedLinear layer that applies the same linear transformation up to the quantization error.
@@ -315,14 +318,16 @@ open class QuantizedLinear: Linear, Quantized {
         mode: QuantizationMode = .affine
     ) {
         self.init(
-            weight: other.weight, bias: other.bias, groupSize: groupSize, bits: bits, mode: mode)
+            weight: other.weight, bias: other.bias, groupSize: groupSize, bits: bits,
+            mode: mode, referencePrefill: other.referencePrefill)
     }
 
     /// Initialize a ``QuantizedLinear`` with non-quantized weights and bias.
     public init(
         weight: MLXArray, bias: MLXArray?, groupSize: Int = 64, bits: Int = 4,
         mode: QuantizationMode = .affine,
-        globalScale: MLXArray? = nil
+        globalScale: MLXArray? = nil,
+        referencePrefill: Bool = false
     ) {
         self.groupSize = groupSize
         self.bits = bits
@@ -335,7 +340,9 @@ open class QuantizedLinear: Linear, Quantized {
         self.scales = scales
         self.biases = biases
 
-        super.init(weight: quantizedWeight, bias: bias)
+        super.init(
+            weight: quantizedWeight, bias: bias,
+            referencePrefill: referencePrefill)
 
         self.freeze()
     }
@@ -348,7 +355,8 @@ open class QuantizedLinear: Linear, Quantized {
         weight: MLXArray, bias: MLXArray? = nil, scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int,
         mode: QuantizationMode = .affine,
-        globalScale: MLXArray? = nil
+        globalScale: MLXArray? = nil,
+        referencePrefill: Bool = false
     ) {
         self.groupSize = groupSize
         self.bits = bits
@@ -356,7 +364,7 @@ open class QuantizedLinear: Linear, Quantized {
         self.scales = scales
         self.biases = biases
         self._globalScale.wrappedValue = globalScale
-        super.init(weight: weight, bias: bias)
+        super.init(weight: weight, bias: bias, referencePrefill: referencePrefill)
     }
 
     public override func unfreeze(
@@ -375,7 +383,8 @@ open class QuantizedLinear: Linear, Quantized {
             transpose: true,
             groupSize: groupSize,
             bits: bits,
-            mode: mode
+            mode: mode,
+            referencePrefill: referencePrefill
         )
         result = applyNVFP4GlobalScale(result, globalScale: globalScale)
         if let bias {
