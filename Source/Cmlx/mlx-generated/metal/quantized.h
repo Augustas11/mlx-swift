@@ -2101,6 +2101,128 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
   }
 }
 
+// macprovider: affine_qmv_mma1 is the K reduction of affine_qmv_mma<WK = 4>
+// for a few x rows, written as plain float32 fma chains: no simdgroup matrix
+// op, no threadgroup memory and no unused row slots.
+//
+// Invariant: every output element takes exactly the float32 operations of
+// affine_qmv_mma<T, group_size, bits, 4, BN, TM>, in the same order, so it has
+// the same bits. For y[m][n]:
+//   for s in 0..3:                          (one thread per s)
+//     C_s = +0
+//     for k = 128 s, 128 (s + 4), 128 (s + 8), ... < K:
+//       for f = 0..15:
+//         for c = 0..7:
+//           i   = k + 16 c + f
+//           a   = fma(float(q[n][i]), float(scale[n][i / gs]),
+//                     float(bias[n][i / gs]))
+//           C_s = fma(a, float(x[m][i]), C_s)
+//   y[m][n] = T(((C_0 + C_1) + C_2) + C_3)
+// In affine_qmv_mma, s is the simdgroup (simd_gid), f = 4 g + i is the order
+// of its mma calls inside a K block, and "for c" is what one
+// simdgroup_multiply_accumulate on simdgroup_float8x8 does for one element: a
+// chain of fma over the 8 inner products in increasing index, starting from
+// the accumulator.
+//
+// The two kernels must change together. Whatever changes in affine_qmv_mma
+// among these has to be mirrored here, or a row's bits will depend on how
+// many rows share the call (see qmv_mma1_max_rows in quantized.cpp):
+// - WK, the number of partial sums, and the order they are added in,
+// - BK = 128, the K block one simdgroup reduces per step,
+// - the 16 x 8 walk of a block (which elements one mma call multiplies, and
+//   the order of the calls),
+// - a = fma(q, scale, bias) and the float32 accumulator,
+// - the 8x8 float fragment itself: with another fragment type or another
+//   matrix op the inner chain is no longer this one.
+// BN and TM of affine_qmv_mma only tile columns and rows and are free.
+//
+// Layout: one threadgroup is one simdgroup of 32 threads, 8 quads. A quad
+// owns one output column and lane s of the quad runs partial C_s. The four
+// partials meet through simd_shuffle.
+//
+// Dispatch: grid (N / 8, M, 1), threadgroup (32, 1, 1), so the kernel takes
+// no M. Needs K % 128 == 0, N % 8 == 0 and a w offset that is a multiple of 4
+// bytes. Any M works: a row never reads another row.
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmv_mma1(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(
+      (bits == 4 || bits == 8) &&
+          (group_size == 32 || group_size == 64 || group_size == 128),
+      "qmv_mma1 reads 4 and 8 bits at group sizes 32, 64 and 128");
+
+  constexpr int WK = 4;
+  constexpr int BK = 128;
+  constexpr int pack_factor = 8 / bits;
+  constexpr int words = BK / pack_factor / 4; // uints of one row in a K block
+  constexpr int groups = BK / group_size; // scale groups in a K block
+
+  const int s = simd_lid % WK;
+  const int n = tid.x * 8 + simd_lid / WK;
+  const int row_bytes = K / pack_factor;
+  const int row_scales = K / group_size;
+
+  const device uint* wl = (const device uint*)((const device uint8_t*)w +
+      n * static_cast<int64_t>(row_bytes));
+  scales += n * static_cast<int64_t>(row_scales);
+  biases += n * static_cast<int64_t>(row_scales);
+  x += tid.y * static_cast<int64_t>(K);
+
+  float acc = 0.0f;
+  for (int k = s * BK; k < K; k += WK * BK) {
+    uint ws[words];
+    float sc[groups];
+    float bs[groups];
+    const device uint* wk = wl + k / pack_factor / 4;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < words; i++) {
+      ws[i] = wk[i];
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short g = 0; g < groups; g++) {
+      sc[g] = float(scales[k / group_size + g]);
+      bs[g] = float(biases[k / group_size + g]);
+    }
+
+    const device T* xk = x + k;
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < 16; f++) {
+      STEEL_PRAGMA_UNROLL
+      for (short c = 0; c < 8; c++) {
+        const short g = (16 * c) / group_size;
+        uint q;
+        if constexpr (bits == 4) {
+          q = (ws[2 * c + f / 8] >> (4 * (f % 8))) & 0xf;
+        } else {
+          q = (ws[4 * c + f / 4] >> (8 * (f % 4))) & 0xff;
+        }
+        const float a = fma(float(q), sc[g], bs[g]);
+        acc = fma(a, float(xk[16 * c + f]), acc);
+      }
+    }
+  }
+
+  const ushort quad = simd_lid & ~3u;
+  const float c1 = simd_shuffle(acc, ushort(quad + 1));
+  const float c2 = simd_shuffle(acc, ushort(quad + 2));
+  const float c3 = simd_shuffle(acc, ushort(quad + 3));
+  if (s == 0) {
+    float c0 = acc;
+    c0 += c1;
+    c0 += c2;
+    c0 += c3;
+    y[tid.y * static_cast<int64_t>(N) + n] = static_cast<T>(c0);
+  }
+}
+
 template <
     typename T,
     const int group_size,
