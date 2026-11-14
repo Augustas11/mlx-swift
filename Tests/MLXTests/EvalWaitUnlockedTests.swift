@@ -223,6 +223,55 @@ import XCTest
             XCTAssertGreaterThan(EvalWaitPathCounters.counts.unlockedWaits, iterations)
         }
 
+        /// Thread A schedules `x` with `asyncEval` and reads it with `item()`
+        /// (the unlocked wait on an array another eval already scheduled) while
+        /// thread B evaluates a graph that takes `x` as an input and then
+        /// synchronizes the default GPU stream (`Stream.synchronize`, which
+        /// waits under the lock).  Every value matches the single-threaded run
+        /// and the loop terminates.
+        func testAsyncEvalItemAgainstEvalAsInputAndStreamSynchronize() {
+            let iterations = 300
+            var expectedX: [Float] = []
+            var expectedY: [Float] = []
+            for i in 0 ..< iterations {
+                let x = Self.graph(i).sum()
+                let y = x * 2 + 1
+                eval(x, y)
+                expectedX.append(x.item(Float.self))
+                expectedY.append(y.item(Float.self))
+            }
+            let ex = expectedX
+            let ey = expectedY
+            EvalWaitPathCounters.reset()
+
+            let shared = Box<MLXArray?>(nil)
+            let barrier = Barrier(2)
+            let mismatches = Box(0)
+
+            onTwoThreads(timeout: 60) { t in
+                for i in 0 ..< iterations {
+                    if t == 0 { shared.value = Self.graph(i).sum() }
+                    barrier.arriveAndWait()
+                    let x = shared.value!
+                    if t == 0 {
+                        asyncEval(x)
+                        if x.item(Float.self) != ex[i] { mismatches.update { $0 += 1 } }
+                    } else {
+                        let y = x * 2 + 1
+                        eval(y)
+                        Stream.gpu.synchronize()
+                        if y.item(Float.self) != ey[i] { mismatches.update { $0 += 1 } }
+                        if x.item(Float.self) != ex[i] { mismatches.update { $0 += 1 } }
+                    }
+                    barrier.arriveAndWait()
+                }
+            }
+
+            XCTAssertEqual(mismatches.value, 0)
+            XCTAssertGreaterThan(EvalWaitPathCounters.counts.unlockedWaits, 0)
+            XCTAssertEqual(EvalWaitPathCounters.counts.recursiveStock, 0)
+        }
+
         // MARK: - (c) recursive entry
 
         func testRecursiveEvalUnderTheLockTakesTheStockPath() {
@@ -351,6 +400,79 @@ import XCTest
                 }
             }
             XCTAssertEqual(other.value, expected)
+        }
+
+        /// One eval call over a broken kernel on one GPU stream and a good
+        /// output on a second GPU stream, in both orders and with the broken
+        /// kernel on either stream.  Each call reports exactly one error and
+        /// returns, the lock is released (another thread evals), and a later
+        /// eval of the good output is correct.  The broken kernel fails while
+        /// encoding, so this covers the failed-async-schedule fallback; a device
+        /// error raised from an event wait (`mlx_eval_wait_wait`) cannot be
+        /// produced deterministically from a test.
+        func testTwoStreamEvalWithOneBrokenKernelReportsOnceAndKeepsTheGoodOutput() {
+            let expected = Self.graph(5).asArray(Float.self)
+            let kernel = MLXFast.metalKernel(
+                name: "eval_wait_broken_two_streams",
+                inputNames: ["a"],
+                outputNames: ["out1"],
+                source: """
+                        this is not metal either;
+                    """)
+            let second = Stream(Device.gpu)
+
+            for (badOnSecond, badFirst) in [(false, true), (false, false), (true, true), (true, false)] {
+                let label = "badOnSecond=\(badOnSecond) badFirst=\(badFirst)"
+                let badStream: StreamOrDevice = badOnSecond ? .stream(second) : .default
+                let goodStream: StreamOrDevice = badOnSecond ? .default : .stream(second)
+
+                let a = MLXArray([Float(0), 1, 2, 3], [2, 2])
+                let goodBox = Box(matmul(a, a, stream: goodStream) + MLXArray(Float(1)))
+                let messages = Box<[String]>([])
+
+                // The failing eval runs on its own thread so a hang fails the
+                // test instead of the run.
+                onTwoThreads(timeout: 30) { t in
+                    guard t == 0 else { return }
+                    withErrorHandler({ message in messages.update { $0.append(message) } }) {
+                        let bad = kernel(
+                            [MLXArray.ones([4])],
+                            grid: (4, 1, 1),
+                            threadGroup: (4, 1, 1),
+                            outputShapes: [[4]],
+                            outputDTypes: [.float32],
+                            stream: badStream)[0]
+                        let good = goodBox.value
+                        eval(badFirst ? [bad, good] : [good, bad])
+                        XCTAssertEqual(EvalLockOwnership.depth, 0, label)
+                    }
+                }
+                XCTAssertEqual(messages.value.count, 1, "\(label): \(messages.value)")
+                XCTAssertEqual(EvalLockOwnership.depth, 0, label)
+
+                // The lock is free for another thread.
+                let other = Box<[Float]>([])
+                onTwoThreads(timeout: 30) { t in
+                    if t == 1 {
+                        let y = Self.graph(5)
+                        eval(y)
+                        other.value = y.asArray(Float.self)
+                    }
+                }
+                XCTAssertEqual(other.value, expected, label)
+
+                // The good output evaluates to the right value.
+                let goodValue = Box<[Float]>([])
+                onTwoThreads(timeout: 30) { t in
+                    if t == 0 {
+                        let good = goodBox.value
+                        eval(good)
+                        goodValue.value = good.asArray(Float.self)
+                    }
+                }
+                XCTAssertEqual(goodValue.value, [3, 4, 7, 12], label)
+            }
+            second.synchronize()
         }
     }
 
