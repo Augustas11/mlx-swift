@@ -2114,8 +2114,9 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
   }
 }
 
-// macprovider: affine_qmv_mma1 is the K reduction of affine_qmv_mma<WK = 4>
-// for a few x rows, written as plain float32 fma chains: no simdgroup matrix
+// macprovider: affine_qmv_mma1 (and its forms affine_qmv_mma1w and
+// affine_qmv_mma1s below) is the K reduction of affine_qmv_mma<WK = 4> for a
+// few x rows, written as plain float32 fma chains: no simdgroup matrix
 // op, no threadgroup memory and no unused row slots.
 //
 // Invariant: every output element takes exactly the float32 operations of
@@ -2137,9 +2138,10 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
 // chain of fma over the 8 inner products in increasing index, starting from
 // the accumulator.
 //
-// The two kernels must change together. Whatever changes in affine_qmv_mma
-// among these has to be mirrored here, or a row's bits will depend on how
-// many rows share the call (see qmv_mma1_max_rows in quantized.cpp):
+// These kernels and affine_qmv_mma must change together. Whatever changes in
+// affine_qmv_mma among these has to be mirrored here, or a row's bits will
+// depend on how many rows share the call (see qmv_mma1_max_rows in
+// quantized.cpp):
 // - WK, the number of partial sums, and the order they are added in,
 // - BK = 128, the K block one simdgroup reduces per step,
 // - the 16 x 8 walk of a block (which elements one mma call multiplies, and
@@ -2149,15 +2151,200 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
 //   matrix op the inner chain is no longer this one.
 // BN and TM of affine_qmv_mma only tile columns and rows and are free.
 //
-// Layout: one threadgroup is one simdgroup of 32 threads, 8 quads. A quad
-// owns one output column and lane s of the quad runs partial C_s. The four
-// partials meet through simd_shuffle.
+// Three kernels implement this one-row order. They differ only in how
+// float(q), float(x) and the loads are produced (each value bit-identical)
+// and in the thread layout:
+// - affine_qmv_mma1 (half2 dequant): float(q) comes from qmv_mma's own trick,
+//   (p | 0x64006400) read as half2 minus 1024, which is exact for q < 1024,
+//   two weights per half2 op. The pairs are weights 16 c + f and
+//   16 (c + 1) + f, c even, consumed in chain order. x is read as vec<T, 8>
+//   and the weights as uint4 per K block.
+// - affine_qmv_mma1w (wide N): the same, but a quad owns two columns, n and
+//   n + 8, so one x load and conversion serves both.
+// - affine_qmv_mma1s (scalar): scalar loads and float(q) from the masked
+//   integer, the first form of this kernel.
+// Each was 0 differing elements against the first form and against
+// affine_qmv_mma at M = 1, over bits 4/8, group sizes 32/64/128, float32,
+// float16 and bfloat16 and the five shapes below, on an M5 and an M3 Ultra
+// (standalone harness).
 //
-// Dispatch: grid (N / 8, M, 1), threadgroup (32, 1, 1), so the kernel takes
-// no M. Needs K % 128 == 0, N % 8 == 0 and a w offset that is a multiple of 4
-// bytes. Any M works: a row never reads another row.
+// Measured on an M3 Ultra, 4-bit float16 group 64, one row, us per dispatch
+// (two runs; mma1s is the scalar form, mma1 the half2 form, mma1w wide N):
+//   K x N        qmv_fast     mma1s        mma1          mma1w
+//   4096x4096    33.1/33.9    36.0/32.0    31.0/28.7     37.3/34.8
+//   4096x14336   44.8/44.2    66.4/63.9    61.6/64.1     51.9/~56
+//   14336x4096   51.7/50.7    76.9/76.1    64.3/60.8     87.8/~84
+//   4096x1024    19.6/18.1    22.9/22.1    24.0/22.8     34.5/~31
+//   1664x2048    17.5/17.3    20.8/20.8    19.8/20.0     24.8/~24
+// 8-bit: the half2 form is within about +-8% of the scalar form except
+// 4096x1024 (+21%), and the wide form is slower everywhere. quantized.cpp
+// (qmv_mma1) picks the kernel from these numbers.
+//
+// Layout: one threadgroup is one simdgroup of 32 threads, 8 quads. A quad
+// owns NC output columns (n0 and n0 + 8 for NC = 2) and lane s of the quad
+// runs partial C_s for each of them. The four partials meet through
+// simd_shuffle.
+//
+// Dispatch: grid (N / (8 NC), M, 1), threadgroup (32, 1, 1), so the kernel
+// takes no M. Needs K % 128 == 0, N % (8 NC) == 0, a w offset that is a
+// multiple of 16 bytes and an x offset that is a multiple of 8 elements (the
+// uint4 and vec<T, 8> loads; affine_qmv_mma1s needs 4 bytes and 1 element).
+// Any M works: a row never reads another row.
+template <typename T, int group_size, int bits, int NC>
+METAL_FUNC void qmv_mma1_h2_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    uint3 tid,
+    uint simd_lid) {
+  static_assert(
+      (bits == 4 || bits == 8) &&
+          (group_size == 32 || group_size == 64 || group_size == 128),
+      "qmv_mma1 reads 4 and 8 bits at group sizes 32, 64 and 128");
+
+  constexpr int WK = 4;
+  constexpr int BK = 128;
+  constexpr int pack_factor = 8 / bits;
+  constexpr int words = BK / pack_factor / 4; // uints of one row in a K block
+  constexpr int groups = BK / group_size; // scale groups in a K block
+
+  const int s = simd_lid % WK;
+  const int n0 = tid.x * 8 * NC + simd_lid / WK;
+  const int row_bytes = K / pack_factor;
+  const int row_scales = K / group_size;
+
+  const device uint8_t* wl[NC];
+  const device T* sl[NC];
+  const device T* bl[NC];
+  float acc[NC];
+  STEEL_PRAGMA_UNROLL
+  for (short cc = 0; cc < NC; cc++) {
+    const int n = n0 + 8 * cc;
+    wl[cc] = (const device uint8_t*)w + n * static_cast<int64_t>(row_bytes);
+    sl[cc] = scales + n * static_cast<int64_t>(row_scales);
+    bl[cc] = biases + n * static_cast<int64_t>(row_scales);
+    acc[cc] = 0.0f;
+  }
+  x += tid.y * static_cast<int64_t>(K);
+
+  for (int k = s * BK; k < K; k += WK * BK) {
+    vec<T, 8> xv[16];
+    uint4 ws[NC][words / 4];
+    float sc[NC][groups];
+    float bs[NC][groups];
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 16; i++) {
+      xv[i] = *(const device vec<T, 8>*)(x + k + 8 * i);
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short cc = 0; cc < NC; cc++) {
+      const device uint4* wk = (const device uint4*)(wl[cc] + k / pack_factor);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < words / 4; i++) {
+        ws[cc][i] = wk[i];
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short g = 0; g < groups; g++) {
+        sc[cc][g] = float(sl[cc][k / group_size + g]);
+        bs[cc][g] = float(bl[cc][k / group_size + g]);
+      }
+    }
+
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < 16; f++) {
+      // Pairs (f, c) and (f, c + 1), c even, as qmv_mma pairs them.
+      STEEL_PRAGMA_UNROLL
+      for (short c = 0; c < 8; c += 2) {
+        const float x0 = float(xv[(16 * c + f) / 8][(16 * c + f) % 8]);
+        const float x1 =
+            float(xv[(16 * c + 16 + f) / 8][(16 * c + 16 + f) % 8]);
+        const short g0 = (16 * c) / group_size;
+        const short g1 = (16 * c + 16) / group_size;
+        STEEL_PRAGMA_UNROLL
+        for (short cc = 0; cc < NC; cc++) {
+          uint p;
+          if constexpr (bits == 4) {
+            // weight 16 c + f is nibble f % 8 of word 2 c + f / 8
+            const short wlo = 2 * c + f / 8;
+            const short whi = 2 * c + 2 + f / 8;
+            const uint lo = ws[cc][wlo / 4][wlo % 4];
+            const uint hi = ws[cc][whi / 4][whi % 4];
+            const short sh = 4 * (f % 8);
+            p = ((lo >> sh) & 0xf) | (((hi >> sh) & 0xf) << 16);
+          } else {
+            // weight 16 c + f is byte f % 4 of word 4 c + f / 4
+            const short wlo = 4 * c + f / 4;
+            const short whi = 4 * c + 4 + f / 4;
+            const uint lo = ws[cc][wlo / 4][wlo % 4];
+            const uint hi = ws[cc][whi / 4][whi % 4];
+            const short sh = 8 * (f % 4);
+            p = ((lo >> sh) & 0xff) | (((hi >> sh) & 0xff) << 16);
+          }
+          // With 0x6400 set each half reads as 1024 + q, and taking 1024
+          // off again is exact.
+          const half2 v = as_type<half2>(p | 0x64006400) - half2(1024.0h);
+          const float a0 = fma(float(v.x), sc[cc][g0], bs[cc][g0]);
+          acc[cc] = fma(a0, x0, acc[cc]);
+          const float a1 = fma(float(v.y), sc[cc][g1], bs[cc][g1]);
+          acc[cc] = fma(a1, x1, acc[cc]);
+        }
+      }
+    }
+  }
+
+  const ushort quad = simd_lid & ~3u;
+  STEEL_PRAGMA_UNROLL
+  for (short cc = 0; cc < NC; cc++) {
+    const float c1 = simd_shuffle(acc[cc], ushort(quad + 1));
+    const float c2 = simd_shuffle(acc[cc], ushort(quad + 2));
+    const float c3 = simd_shuffle(acc[cc], ushort(quad + 3));
+    if (s == 0) {
+      float c0 = acc[cc];
+      c0 += c1;
+      c0 += c2;
+      c0 += c3;
+      y[tid.y * static_cast<int64_t>(N) + n0 + 8 * cc] = static_cast<T>(c0);
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void affine_qmv_mma1(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  qmv_mma1_h2_impl<T, group_size, bits, 1>(
+      w, scales, biases, x, y, K, N, tid, simd_lid);
+}
+
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmv_mma1w(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  qmv_mma1_h2_impl<T, group_size, bits, 2>(
+      w, scales, biases, x, y, K, N, tid, simd_lid);
+}
+
+// The scalar form: one column per quad, grid (N / 8, M, 1).
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmv_mma1s(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
