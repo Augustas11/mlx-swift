@@ -28,6 +28,9 @@ let evalLock = NSRecursiveLock()
 /// owned by a thread, and a task-local binding would be inherited by e.g. a
 /// `Task {}` created inside a traced function, which runs on another thread
 /// that does not hold the lock.
+///
+/// The depth is kept in every build: ``eval(_:)-(Collection<MLXArray>)`` reads
+/// it to decide whether it may release the lock while the device runs.
 enum EvalLockOwnership {
 
     private static let depthKey: pthread_key_t = {
@@ -102,6 +105,29 @@ enum EvalLockOwnership {
         }
     }
 
+    /// Which branch of ``evalReleasingLockForWait(_:stock:)`` ran, so a test can
+    /// show the path it means to cover was really taken.
+    enum EvalWaitPathCounters {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var unlockedWaitCount = 0
+        nonisolated(unsafe) private static var recursiveStockCount = 0
+
+        static func recordUnlockedWait() { lock.withLock { unlockedWaitCount += 1 } }
+        static func recordRecursiveStock() { lock.withLock { recursiveStockCount += 1 } }
+
+        /// (evals that waited unlocked, recursive evals that took the stock path)
+        static var counts: (unlockedWaits: Int, recursiveStock: Int) {
+            lock.withLock { (unlockedWaitCount, recursiveStockCount) }
+        }
+
+        static func reset() {
+            lock.withLock {
+                unlockedWaitCount = 0
+                recursiveStockCount = 0
+            }
+        }
+    }
+
 #endif
 
 /// How the current call to ``withEvalLockState(_:)`` holds
@@ -147,7 +173,7 @@ func withEvalLock<R>(_ body: () throws -> R) rethrows -> R {
 /// This is the observable difference between ``eval(_:)-(MLXArray...)`` and
 /// ``asyncEval(_:)-(Collection<MLXArray>)``, and the only direct way to check
 /// that `eval` is still synchronous now that it schedules with
-/// `mlx_async_eval` and waits with `mlx_eval`.
+/// it schedules under `evalLock` and waits outside it.
 ///
 /// Internal: exists for the tests (`EvalTests`), which cannot reach `Cmlx`
 /// directly.  Call this only on the thread that owns `array`.
@@ -238,6 +264,55 @@ private func requireOutsideTransform(_ caller: StaticString = #function) {
     }
 }
 
+/// Synchronous eval of `arrays` that holds ``evalLock`` while the graph is
+/// scheduled and releases it while the device runs (macprovider #2338).
+///
+/// Encoding and command submission stay under the lock. Only the wait for
+/// completion runs unlocked, and it waits on copies of the completion events,
+/// so it reads and writes no array: another thread may use the same arrays as
+/// eval inputs meanwhile. The lock is taken again to mark the outputs
+/// available, so every array status and event write stays under the lock.
+///
+/// `stock` runs instead, under the lock, when this thread already holds
+/// ``evalLock`` (a recursive entry: the lock would not really be released, and
+/// the caller may rely on the eval completing inside its locked region). The
+/// shim itself falls back to the stock synchronous eval for CPU streams and
+/// when the asynchronous schedule throws.
+@inline(__always)
+private func evalReleasingLockForWait(
+    _ arrays: UnsafeBufferPointer<mlx_array>, stock: () -> Void
+) {
+    if EvalLockOwnership.isHeldByCurrentThread {
+        #if DEBUG
+            EvalWaitPathCounters.recordRecursiveStock()
+        #endif
+        withEvalLock { stock() }
+        return
+    }
+    var pending = mlx_eval_wait(ctx: nil)
+    let status = withEvalLock {
+        mlx_eval_wait_begin(&pending, arrays.baseAddress, arrays.count)
+    }
+    guard status == 0, pending.ctx != nil else { return }
+    #if DEBUG
+        EvalWaitPathCounters.recordUnlockedWait()
+    #endif
+    _ = mlx_eval_wait_wait(pending)
+    withEvalLock {
+        mlx_eval_wait_finish(pending)
+    }
+    mlx_eval_wait_free(pending)
+}
+
+/// Synchronous eval of a single array context; see ``evalReleasingLockForWait(_:stock:)``.
+func evalReleasingLockForWait(_ ctx: mlx_array) {
+    withUnsafePointer(to: ctx) { p in
+        evalReleasingLockForWait(UnsafeBufferPointer(start: p, count: 1)) {
+            _ = mlx_array_eval(ctx)
+        }
+    }
+}
+
 /// Evaluate one or more `MLXArray`
 ///
 /// ### See Also
@@ -265,26 +340,15 @@ public func eval(_ arrays: MLXArray...) {
 /// ### See Also
 /// - <doc:lazy-evaluation>
 public func eval(_ arrays: some Collection<MLXArray>) {
-    let vectorArray = new_mlx_vector_array(arrays)
-    defer { mlx_vector_array_free(vectorArray) }
-
-    let waitOutsideLock = withEvalLockState { state in
-        switch state {
-        case .nested:
-            // cannot release the lock to wait, and async eval rejects
-            // vjp/jvp tracers
-            _ = mlx_eval(vectorArray)
-            return false
-
-        case .outermost:
-            // schedule under the lock, wait (below) outside it
-            return mlx_async_eval(vectorArray) == 0
+    let ctxs = arrays.map { $0.ctx }
+    withExtendedLifetime(arrays) {
+        ctxs.withUnsafeBufferPointer { buffer in
+            evalReleasingLockForWait(buffer) {
+                let vector_array = mlx_vector_array_new_data(buffer.baseAddress, buffer.count)
+                mlx_eval(vector_array)
+                mlx_vector_array_free(vector_array)
+            }
         }
-    }
-
-    if waitOutsideLock {
-        // the arrays are scheduled, so this only waits for them
-        _ = mlx_eval(vectorArray)
     }
 }
 

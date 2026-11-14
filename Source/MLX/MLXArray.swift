@@ -600,7 +600,9 @@ public class MLXArray: ExpressibleByArrayLiteral {
     /// MLX is lazy and arrays are not fully realized until they are evaluated.  This method is typically
     /// not needed as all reads ensure the contents are evaluated.
     public func eval() {
-        MLX.eval(self)
+        withExtendedLifetime(self) {
+            evalReleasingLockForWait(ctx)
+        }
     }
 
     /// Force evaluation and return a ``MaterializedArray`` snapshot of `self`.
