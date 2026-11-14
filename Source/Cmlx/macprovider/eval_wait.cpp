@@ -4,6 +4,7 @@
 // include/mlx_eval_wait.h for the phase contract. Only public mlx core API is
 // used; no upstream mlx or mlx-c file is modified.
 
+#include <string>
 #include <vector>
 
 #include "mlx/c/error.h"
@@ -125,12 +126,23 @@ extern "C" int mlx_eval_wait_wait(const mlx_eval_wait w) {
   if (!w.ctx) {
     return 0;
   }
-  try {
-    for (auto& e : static_cast<Pending*>(w.ctx)->events) {
+  // Wait on every event even after one throws: an output whose event was not
+  // waited would stay evaluated-but-unavailable after phase 3. Only the first
+  // error is reported, once.
+  std::string first_error;
+  bool failed = false;
+  for (auto& e : static_cast<Pending*>(w.ctx)->events) {
+    try {
       e.wait();
+    } catch (std::exception& ex) {
+      if (!failed) {
+        failed = true;
+        first_error = ex.what();
+      }
     }
-  } catch (std::exception& e) {
-    mlx_error(e.what());
+  }
+  if (failed) {
+    mlx_error(first_error.c_str());
     return 1;
   }
   return 0;
