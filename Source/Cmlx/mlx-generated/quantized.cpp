@@ -2353,7 +2353,7 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
 // last partials run fewer blocks or none and stay +0; both kernels do that
 // the same way, since both walk k = 128 s, 128 (s + WK), ... < K.
 //
-// WK is chosen once per process (8 on generation 15 GPUs, 4 elsewhere, or
+// WK is chosen once per process (8 on generation 13 and 15 GPUs, 4 elsewhere, or
 // MLX_METAL_QMV_MMA_WK = 4, 8 or 16; see qmv_mma_wk in quantized.cpp, which
 // has the measurement) and both kernels take the same value on every call.
 // A row alone and in a batch gave the same bits at 4, 8 and 16 on an M3
