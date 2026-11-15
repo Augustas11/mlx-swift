@@ -2067,6 +2067,9 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
     }
   }
 
+  // macprovider: simdgroup 0 adds the partials of simdgroups 1..WK-1 to its
+  // own in that order; affine_qmv_mma1 repeats it. WK is 4, 8 or 16
+  // (MLX_METAL_QMV_MMA_WK), so Ps is at most 15 * 8 * 32 floats, 15 KiB.
   constexpr int tile_elems = TN * TM * 2;
   threadgroup float Ps[(WK - 1) * tile_elems * 32];
   if (simd_gid > 0) {
@@ -2114,28 +2117,40 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
   }
 }
 
-// macprovider: affine_qmv_mma1 is the K reduction of affine_qmv_mma<WK = 4>
+// macprovider: affine_qmv_mma1<WK> is the K reduction of affine_qmv_mma<WK>
 // for a few x rows, written as plain float32 fma chains: no simdgroup matrix
 // op, no threadgroup memory and no unused row slots.
 //
 // Invariant: every output element takes exactly the float32 operations of
-// affine_qmv_mma<T, group_size, bits, 4, BN, TM>, in the same order, so it has
-// the same bits. For y[m][n]:
-//   for s in 0..3:                          (one thread per s)
+// affine_qmv_mma<T, group_size, bits, WK, BN, TM>, in the same order, so it
+// has the same bits. For y[m][n]:
+//   for s in 0..WK-1:                       (one thread per s)
 //     C_s = +0
-//     for k = 128 s, 128 (s + 4), 128 (s + 8), ... < K:
+//     for k = 128 s, 128 (s + WK), 128 (s + 2 WK), ... < K:
 //       for f = 0..15:
 //         for c = 0..7:
 //           i   = k + 16 c + f
 //           a   = fma(float(q[n][i]), float(scale[n][i / gs]),
 //                     float(bias[n][i / gs]))
 //           C_s = fma(a, float(x[m][i]), C_s)
-//   y[m][n] = T(((C_0 + C_1) + C_2) + C_3)
+//   y[m][n] = T((((C_0 + C_1) + C_2) + ...) + C_{WK-1})
 // In affine_qmv_mma, s is the simdgroup (simd_gid), f = 4 g + i is the order
 // of its mma calls inside a K block, and "for c" is what one
 // simdgroup_multiply_accumulate on simdgroup_float8x8 does for one element: a
 // chain of fma over the 8 inner products in increasing index, starting from
-// the accumulator.
+// the accumulator. Its combine has simdgroup 0 add the partials of
+// simdgroups 1, 2, ..., WK-1 to its own, one at a time, which is the left to
+// right sum above. When K < 128 WK, or K is not a multiple of 128 WK, the
+// last partials run fewer blocks or none and stay +0; both kernels do that
+// the same way, since both walk k = 128 s, 128 (s + WK), ... < K.
+//
+// WK is chosen once per process (8 on generation 15 GPUs, 4 elsewhere, or
+// MLX_METAL_QMV_MMA_WK = 4, 8 or 16; see qmv_mma_wk in quantized.cpp, which
+// has the measurement) and both kernels take the same value on every call.
+// A row alone and in a batch gave the same bits at 4, 8 and 16 on an M3
+// Ultra (the small-M tests). A larger WK shortens the dependent fma chain of each
+// partial (K / (128 WK) blocks of 128 fma) and changes the bits of every
+// output against WK = 4, so a process must not mix two values.
 //
 // The two kernels must change together. Whatever changes in affine_qmv_mma
 // among these has to be mirrored here, or a row's bits will depend on how
@@ -2149,14 +2164,14 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
 //   matrix op the inner chain is no longer this one.
 // BN and TM of affine_qmv_mma only tile columns and rows and are free.
 //
-// Layout: one threadgroup is one simdgroup of 32 threads, 8 quads. A quad
-// owns one output column and lane s of the quad runs partial C_s. The four
-// partials meet through simd_shuffle.
+// Layout: one threadgroup is one simdgroup of 32 threads, split into 32 / WK
+// lane groups of WK lanes. A group owns one output column and lane s of the
+// group runs partial C_s. The partials meet through simd_shuffle.
 //
-// Dispatch: grid (N / 8, M, 1), threadgroup (32, 1, 1), so the kernel takes
-// no M. Needs K % 128 == 0, N % 8 == 0 and a w offset that is a multiple of 4
-// bytes. Any M works: a row never reads another row.
-template <typename T, int group_size, int bits>
+// Dispatch: grid (N WK / 32, M, 1), threadgroup (32, 1, 1), so the kernel
+// takes no M. Needs K % 128 == 0, N % (32 / WK) == 0 and a w offset that is a
+// multiple of 4 bytes. Any M works: a row never reads another row.
+template <typename T, int group_size, int bits, int WK>
 [[kernel]] void affine_qmv_mma1(
     const device uint32_t* w,
     const device T* scales,
@@ -2171,15 +2186,16 @@ template <typename T, int group_size, int bits>
       (bits == 4 || bits == 8) &&
           (group_size == 32 || group_size == 64 || group_size == 128),
       "qmv_mma1 reads 4 and 8 bits at group sizes 32, 64 and 128");
+  static_assert(WK == 4 || WK == 8 || WK == 16, "qmv_mma1 takes WK 4, 8, 16");
 
-  constexpr int WK = 4;
   constexpr int BK = 128;
+  constexpr int cols = 32 / WK; // output columns of one simdgroup
   constexpr int pack_factor = 8 / bits;
   constexpr int words = BK / pack_factor / 4; // uints of one row in a K block
   constexpr int groups = BK / group_size; // scale groups in a K block
 
   const int s = simd_lid % WK;
-  const int n = tid.x * 8 + simd_lid / WK;
+  const int n = tid.x * cols + simd_lid / WK;
   const int row_bytes = K / pack_factor;
   const int row_scales = K / group_size;
 
@@ -2223,15 +2239,14 @@ template <typename T, int group_size, int bits>
     }
   }
 
-  const ushort quad = simd_lid & ~3u;
-  const float c1 = simd_shuffle(acc, ushort(quad + 1));
-  const float c2 = simd_shuffle(acc, ushort(quad + 2));
-  const float c3 = simd_shuffle(acc, ushort(quad + 3));
+  // Every lane runs every shuffle; only lane s == 0 of a group keeps the sum.
+  const ushort base = simd_lid & ~uint(WK - 1);
+  float c0 = acc;
+  STEEL_PRAGMA_UNROLL
+  for (short j = 1; j < WK; j++) {
+    c0 += simd_shuffle(acc, ushort(base + j));
+  }
   if (s == 0) {
-    float c0 = acc;
-    c0 += c1;
-    c0 += c2;
-    c0 += c3;
     y[tid.y * static_cast<int64_t>(N) + n] = static_cast<T>(c0);
   }
 }
