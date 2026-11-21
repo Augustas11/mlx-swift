@@ -172,8 +172,8 @@ func withEvalLock<R>(_ body: () throws -> R) rethrows -> R {
 ///
 /// This is the observable difference between ``eval(_:)-(MLXArray...)`` and
 /// ``asyncEval(_:)-(Collection<MLXArray>)``, and the only direct way to check
-/// that `eval` is still synchronous now that it schedules with
-/// it schedules under `evalLock` and waits outside it.
+/// that `eval` is still synchronous now that it schedules under `evalLock`
+/// and waits outside it.
 ///
 /// Internal: exists for the tests (`EvalTests`), which cannot reach `Cmlx`
 /// directly.  Call this only on the thread that owns `array`.
