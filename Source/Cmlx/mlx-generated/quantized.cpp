@@ -2353,13 +2353,16 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
 // last partials run fewer blocks or none and stay +0; both kernels do that
 // the same way, since both walk k = 128 s, 128 (s + WK), ... < K.
 //
-// WK is chosen once per process (8 on the stock-order route on generation 13 and 15 GPUs, 4 elsewhere, or
-// MLX_METAL_QMV_MMA_WK = 4, 8 or 16; see qmv_mma_wk in quantized.cpp, which
-// has the measurement) and both kernels take the same value on every call.
+// WK follows the op's small-row route (8 on the stock-order route on
+// generation 13 and 15 GPUs, 4 elsewhere, or MLX_METAL_QMV_MMA_WK = 4, 8 or
+// 16; see qmv_mma_partial_sums in quantized.cpp, which has the measurement).
+// Each QuantizedMatmul captures it when built, and both kernels take that
+// value for the op.
 // A row alone and in a batch gave the same bits at 4, 8 and 16 on an M3
 // Ultra (the small-M tests). A larger WK shortens the dependent fma chain of each
 // partial (K / (128 WK) blocks of 128 fma) and changes the bits of every
-// output against WK = 4, so a process must not mix two values.
+// output against WK = 4, so one route must not mix two values; ops of two
+// routes in one process each keep their own.
 //
 // The two kernels must change together. Whatever changes in affine_qmv_mma
 // among these has to be mirrored here, or a row's bits will depend on how
