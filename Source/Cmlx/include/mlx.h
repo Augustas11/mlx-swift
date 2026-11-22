@@ -3,3 +3,4 @@
 #include "mlx/c/linalg.h"
 #include "mlx/c/fast.h"
 #include "mlx_eval_wait.h"
+#include "mlx_qmm_tile.h"
