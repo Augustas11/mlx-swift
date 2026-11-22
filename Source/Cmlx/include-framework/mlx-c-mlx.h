@@ -25,6 +25,7 @@
 #include <Cmlx/mlx-c-ops.h>
 #include <Cmlx/mlx-c-optional.h>
 #include <Cmlx/mlx-c-random.h>
+#include <Cmlx/mlx-c-small_m_route.h>
 #include <Cmlx/mlx-c-stream.h>
 #include <Cmlx/mlx-c-string.h>
 #include <Cmlx/mlx-c-transforms.h>
