@@ -25,6 +25,7 @@
 #include "mlx/c/ops.h"
 #include "mlx/c/optional.h"
 #include "mlx/c/random.h"
+#include "mlx/c/small_m_route.h"
 #include "mlx/c/stream.h"
 #include "mlx/c/string.h"
 #include "mlx/c/transforms.h"
