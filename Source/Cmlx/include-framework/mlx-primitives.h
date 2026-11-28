@@ -444,7 +444,7 @@ class AsStrided : public UnaryPrimitive {
   Strides strides_;
   size_t offset_;
 
-  void eval(const std::vector<array>& inputs, array& out);
+  void eval(const array& in, array& out);
 };
 
 class BitwiseBinary : public UnaryPrimitive {
@@ -848,9 +848,11 @@ class CustomTransforms : public Primitive {
           const std::vector<int>&)> jvp,
       std::function<std::pair<std::vector<array>, std::vector<int>>(
           const std::vector<array>&,
-          const std::vector<int>&)> vmap)
+          const std::vector<int>&)> vmap,
+      bool synchronize_vjps = false)
       : Primitive(stream),
         num_outputs_(num_outputs),
+        synchronize_vjps_(synchronize_vjps),
         vjp_fun_(std::move(vjp)),
         jvp_fun_(std::move(jvp)),
         vmap_fun_(std::move(vmap)) {}
@@ -868,6 +870,7 @@ class CustomTransforms : public Primitive {
   void eval(const std::vector<array>& inputs, std::vector<array>& outputs);
 
   int num_outputs_;
+  bool synchronize_vjps_;
 
   std::function<std::vector<array>(
       const std::vector<array>&,
@@ -1643,12 +1646,18 @@ class QuantizedMatmul : public UnaryPrimitive {
       int group_size,
       int bits,
       QuantizationMode mode,
-      bool transpose)
+      bool transpose,
+      bool reference_prefill = false,
+      int small_m_route = 1,
+      int qmv_mma_wk = 0)
       : UnaryPrimitive(stream),
         group_size_(group_size),
         bits_(bits),
         mode_(mode),
-        transpose_(transpose) {}
+        transpose_(transpose),
+        reference_prefill_(reference_prefill),
+        small_m_route_(small_m_route),
+        qmv_mma_wk_(qmv_mma_wk) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -1659,7 +1668,14 @@ class QuantizedMatmul : public UnaryPrimitive {
   bool is_equivalent(const Primitive& other) const override;
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
   auto state() const {
-    return std::make_tuple(group_size_, bits_, mode_, transpose_);
+    return std::make_tuple(
+        group_size_,
+        bits_,
+        mode_,
+        transpose_,
+        reference_prefill_,
+        small_m_route_,
+        qmv_mma_wk_);
   }
 
  private:
@@ -1667,6 +1683,13 @@ class QuantizedMatmul : public UnaryPrimitive {
   int bits_;
   QuantizationMode mode_;
   bool transpose_;
+  bool reference_prefill_;
+  // macprovider: the small-row route (small_m_route.h) and the qmv_mma
+  // partial-sum count, captured when quantized_matmul builds the op, so the
+  // op keeps them whatever route scope is active when it is evaluated.
+  // qmv_mma_wk_ is 0 where no Metal qmv_mma kernel can run the op.
+  int small_m_route_;
+  int qmv_mma_wk_;
 };
 
 class QQMatmul : public UnaryPrimitive {
